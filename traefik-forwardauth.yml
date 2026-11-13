@@ -1,0 +1,15 @@
+# Put this in Traefik's dynamic config directory in place of the old
+# dynamic-whitelist.yml (which TraefikShaper used to write).
+# This file is NOT mounted into the TraefikShaper container.
+#
+# Keeping the name "dynamic-ipwhitelist" means existing routers that use
+# this middleware need no changes.
+http:
+  middlewares:
+    dynamic-ipwhitelist:
+      forwardAuth:
+        address: "http://traefikshaper:5000/auth"
+        # false: TraefikShaper sees only the direct TCP peer (use with IPSTRATEGY_DEPTH=0).
+        # Set true only if Traefik sits behind another proxy (e.g. Cloudflare) AND the
+        # entrypoint has forwardedHeaders.trustedIPs set; then use IPSTRATEGY_DEPTH=1.
+        trustForwardHeader: false

@@ -1,37 +1,38 @@
-version: '3.3'
-
 services:
-
   traefikshaper:
-    image: l4rm4nd/traefikshaper:latest
-    container_name: traefikshaper
+    # Prebuilt image from GitHub Container Registry
+    image: ghcr.io/kkawkk/traefikshaper:latest
+    # Or build it yourself from this repository instead:
+    # build: .
+    # pull_policy: build
+    container_name: traefikshaper   # must match the forwardAuth address in traefik-forwardauth.yml
     restart: unless-stopped
-    environment:
-      - APPURL=http://localhost:5000 # please change; e.g. https://traefikshaper.example.com
-      - GRANT_HTTP_ENDPOINT=/knock-knock # the endpoint for clients to request access
-      - DEFAULT_PRIVATE_CLASS_SOURCE_RANGE=True # add private class subnets to the IPAllowList per default
-      - IPSTRATEGY_DEPTH=0 # the depth ip strategy used in the IPAllowList middleware; use 1 if traefik runs behind another proxy (e.g. CloudFlare)
-      - EXPIRATION_TIME=300 # expiration time in seconds; or how long access is granted
-      - APPRISE_NOTIFICATION_URL=tgram://bottoken/ChatID # add your preferred apprise url; see https://github.com/caronc/apprise
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
     expose:
-      - 5000/tcp
-    ports:
-      - 5000:5000/tcp
+      - 5000   # reachable by Traefik on the shared network only; never publish with ports:
+    # networks: [proxy]   # must share a network with Traefik
+    environment:
+      - APPURL=https://DOMAIN
+      - GRANT_HTTP_ENDPOINT=/UNIQUEURL
+      - IPSTRATEGY_DEPTH=0 # use 1 if traefik runs behind another proxy (e.g. CloudFlare); see traefik-forwardauth.yml
+      - EXPIRATION_TIME=43200
+      # Removed blanket 172.16.0.0/12 (every Docker network). If something internal
+      # breaks, add only its specific address, e.g. WHITELISTED_IPS=172.18.0.1/32
+      # - WHITELISTED_IPS=172.16.0.0/12
+      - APPRISE_NOTIFICATION_URL=tgram://SECRET
+      - ALLOW_SERVER_IP=True   # always allow this server's own dynamic public IP
+      # - ALLOW_PRIVATE_APPROVALS=False  # True only if clients legitimately arrive from private IPs (e.g. LAN/VPN)
+      # Optional (defaults shown):
+      # - SERVER_IP_CHECK_URLS=https://api.ipify.org,https://ipv4.icanhazip.com,https://checkip.amazonaws.com,https://ipinfo.io/ip
+      # - SERVER_IP_MIN_AGREE=2        # services that must return the same IP
+      # - SERVER_IP_CHECK_INTERVAL=60  # seconds
     volumes:
-      - ./dynamic-whitelist.yml:/app/dynamic-whitelist.yml
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
-    networks:
-      - proxy
-    labels:
-      - traefik.enable=true
-      - traefik.docker.network=proxy
-      - traefik.http.routers.traefikshaper.rule=Host(`traefikshaper.example.com`)
-      - traefik.http.routers.traefikshaper.service=traefikshaper
-      - traefik.http.services.traefikshaper.loadbalancer.server.port=5000
-      # Optional part for traefik middlewares
-      #- traefik.http.routers.traefikshaper.middlewares=local-ipwhitelist@file
-
-networks:
-  proxy:
-    external: true

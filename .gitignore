@@ -1,0 +1,4 @@
+# local backups / not for publishing
+__pycache__/
+*.pyc
+.env

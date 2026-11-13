@@ -1,168 +1,459 @@
-<div align="center" width="100%">
-    <h1>TraefikShaper</h1>
-    <img width="150px" src="logo.png">
-    <p>Docker container to manipulate Traefik's IpAllowList middleware for dynamic IP whitelisting</p><p>
-    <a target="_blank" href="https://github.com/l4rm4nd"><img src="https://img.shields.io/badge/maintainer-LRVT-orange" /></a>
-    <a target="_blank" href="https://GitHub.com/l4rm4nd/TraefikShaper/graphs/contributors/"><img src="https://img.shields.io/github/contributors/l4rm4nd/TraefikShaper.svg" /></a><br>
-    <a target="_blank" href="https://GitHub.com/l4rm4nd/TraefikShaper/commits/"><img src="https://img.shields.io/github/last-commit/l4rm4nd/TraefikShaper.svg" /></a>
-    <a target="_blank" href="https://GitHub.com/l4rm4nd/TraefikShaper/issues/"><img src="https://img.shields.io/github/issues/l4rm4nd/TraefikShaper.svg" /></a>
-    <a target="_blank" href="https://github.com/l4rm4nd/TraefikShaper/issues?q=is%3Aissue+is%3Aclosed"><img src="https://img.shields.io/github/issues-closed/l4rm4nd/TraefikShaper.svg" /></a><br>
-        <a target="_blank" href="https://github.com/l4rm4nd/TraefikShaper/stargazers"><img src="https://img.shields.io/github/stars/l4rm4nd/TraefikShaper.svg?style=social&label=Star" /></a>
-    <a target="_blank" href="https://github.com/l4rm4nd/TraefikShaper/network/members"><img src="https://img.shields.io/github/forks/l4rm4nd/TraefikShaper.svg?style=social&label=Fork" /></a>
-    <a target="_blank" href="https://github.com/l4rm4nd/TraefikShaper/watchers"><img src="https://img.shields.io/github/watchers/l4rm4nd/TraefikShaper.svg?style=social&label=Watch" /></a><br>
-    <a target="_blank" href="https://hub.docker.com/r/l4rm4nd/traefikshaper"><img src="https://badgen.net/badge/icon/l4rm4nd%2Ftraefikshaper:latest?icon=docker&label" /></a><br><p>
-    <a href="https://www.buymeacoffee.com/LRVT" target="_blank"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffee" style="height: 41px !important;width: 174px !important;box-shadow: 0px 3px 2px 0px rgba(190, 190, 190, 0.5) !important;-webkit-box-shadow: 0px 3px 2px 0px rgba(190, 190, 190, 0.5) !important;" ></a>
-</div>
+# TraefikShaper (forwardAuth edition)
 
-## 🔆 How it works
+> **Based on [l4rm4nd/TraefikShaper](https://github.com/l4rm4nd/TraefikShaper)** by l4rm4nd,
+> which came up with the idea of knock-and-approve IP allowlisting for Traefik through
+> Apprise notifications. All credit for the concept goes to the original project. This
+> version is a security-hardened rework of it.
 
-This Docker container provides a Python Flask web application that handles the manipulation of a custom Traefik dynamic configuration file `dynamic-ipwhitelist.yml`. The configuration file is bind mounted into the Flask container and can therefore be manipualted through code.
+### What's improved over the original
 
-Within the dynamic configuration file, an [IpAllowList](https://doc.traefik.io/traefik/middlewares/http/ipallowlist/) middleware is defined, which can be used by other containers. As it is a dynamic configuration file, Traefik can monitor it for changes and reflect those dynamically without the necessity of restarting Traefik itself or any containers behind. So if we add or remove IP addresses to the middleware, Traefik will pick them up and dynamically grant or deny access to a container service.
+| Area | Original | This version |
+|---|---|---|
+| **Traefik integration** | Writes a dynamic config file loaded by Traefik's file provider. That file can define *any* router, so whoever controls the container controls your edge routing. | Uses a [`forwardAuth`](https://doc.traefik.io/traefik/middlewares/http/forwardauth/) middleware. The container writes no Traefik config and mounts nothing. |
+| **IPv6** | Approved IPv6 addresses got `/32`, which allows a whole provider network | Exact-address matching for IPv4 and IPv6 |
+| **Approve link** | A plain GET, so chat link previews could approve requests | GET shows a confirm page; only a POST button click approves |
+| **Revoking** | Not possible | The same link shows a **Revoke access** button until the approval expires |
+| **Link tampering** | Expiry could be edited in the URL; tokens never expired; non-constant-time comparison | Expiry fixed server-side; tokens are 256-bit random, single-use, expire after `PENDING_TTL`, and compared in constant time |
+| **Client IP** | Took the left-most `X-Forwarded-For` entry (client-controlled) without validation; unencoded in the approval link | Picks the IP the same way Traefik's ipStrategy does, validates it, URL-encodes links |
+| **Proxy/gateway bypass** | Docs suggested allowing private ranges, which can let every IPv6 or proxied visitor through | Knocks from non-public IPs are refused; broad private ranges are discouraged |
+| **Flooding** | Per-IP limit only (with IPv6, unlimited addresses); memory grew without bound | Rate limit per IP / IPv6 /64, a global hourly notification cap, and periodic cleanup |
+| **Race conditions** | Unlocked read-modify-write of the config file could put expired IPs back | In-memory state under a lock, no file |
+| **Server's own IP** | Not available | Optional (`ALLOW_SERVER_IP`), with fallback IP services that must agree with each other |
+| **Runtime** | Stale Python base, Flask development server, published port 5000 in the example | `python:3.13-slim`, pinned packages, waitress, non-root, read-only filesystem, healthcheck, internal port only |
 
-The Flask web application offers a custom `/knock-knock` endpoint. If this HTTP endpoint is requested, an approval link will be generated based on the IP address the request originated from. The approval link will then be sent out via a defined Apprise notification channel to an admin. The admin in this case would be the operator of the Traefik reverse proxy. The `/knock-knock` endpoint is typically requested by an external party, which initially does not have access to a container service proxied by Traefik. However, if setup correctly, the external party can access this endpoint and therefore `ask for access`. This will trigger the aforementioned procedure of creating an approval link, sending it out to the admin and waiting for approval.
+---
 
-If the admin would like to grant access, he must open the approval link. That's it. The approval link contains the (WAN) IP address of the external party, a secure token for authorization as well as the same random word shown previously to the external party when asking for access. The admin can instantly grant access by opening the link or first validating the random word or IP address with the external party. Once the link is opened, the (WAN) IP address of the external party is added to the IpAllowList middleware. Therefore, the external party gets temporary access to the container services proxied by Traefik that use the middleware. Access will expire after a predefined period of time. Once access is expired, the admin receives another notification and the external party the standard `403 Forbidden` HTTP error by Traefik.
+Knock-to-access IP allowlisting for services behind [Traefik](https://traefik.io/).
 
-Areas of use:
+A visitor opens a secret "knock" URL. The admin gets a notification (Telegram or any
+other [Apprise](https://github.com/caronc/apprise) target) with an approval link. Once
+the admin approves, the visitor's IP may reach the protected services for a limited time.
 
-- Granting temporary access to web services (alternative to VPN, BasicAuth and static IP whitelists)
+Traefik asks TraefikShaper about every request to a protected router through a
+`forwardAuth` middleware. Because TraefikShaper never writes Traefik configuration, a
+compromise of this container cannot change Traefik routing.
 
-## 🎥 Demo
+---
 
-<img src="poc.gif" width="650" />
+## How it works
 
-## 🔨 Setup and Usage
+```
+                 ┌──────────── every request to a protected router ────────────┐
+                 │                                                             ▼
+Visitor ──► Traefik ──forwardAuth──► TraefikShaper /auth ──► 200 allowed / 403 denied
+                 │
+                 └── /UNIQUEURL (knock) ──► TraefikShaper ──► Apprise ──► Admin
+                                                                            │
+Admin opens approval link ──► confirm page ──► [Approve] (POST) ──► IP allowed
+Admin opens same link again ──► [Revoke access] (POST) ──► IP removed
+```
 
->[!TIP]
-> HHF Technology build a Traefik plugin around this idea. May check it out [here](https://github.com/hhftechnology/ipwhitelistshaper).
+An IP is allowed if it is:
 
-### Prerequisites
+1. `127.0.0.1`, or in `WHITELISTED_IPS` (or in the private ranges if
+   `DEFAULT_PRIVATE_CLASS_SOURCE_RANGE=True`),
+2. the server's own public IP (if `ALLOW_SERVER_IP=True`), or
+3. approved and not yet expired.
 
-You have to enable and use Traefik's feature of dynamic configuration files via the `file` provider.
+All state is in memory. **Restarting the container clears all approvals** and
+invalidates all approval links that were already sent.
 
-As we introduce a new dynamic configuration file and some of you may already use one, it is necessary to enable Traefik's [directory](https://doc.traefik.io/traefik/providers/file/#directory) configuration option for the file provider instead of relying on the `filename` parameter, which allows a single dynamic conf only. To do so, please adjust your static Traefik configuration file as follows:
+### Approval flow
 
-````
-providers:
-  file:
-    directory: /etc/traefik/dynamic-confs/
-    watch: true
-````
+1. The visitor opens `https://DOMAIN/UNIQUEURL` and sees a validation code (e.g. `amber-falcon`).
+2. The admin receives a message with the visitor's IP, the same code and an approval link.
+3. Opening the link shows a **confirm page**. Nothing is approved until the admin clicks
+   **Approve**, so link previews in chat apps can't approve anyone.
+4. After approving, the page shows a **Revoke access** button. The same link keeps working
+   until the approval expires, and opening it again shows the revoke button.
+5. When the approval expires or is revoked, the admin is notified and the link stops working.
 
-Then, create the new directory `dynamic-confs` at your Traefik's bind volume mount. Move all of your previously used dynamic configuration files into this new directory. The directory will be monitored by Traefik from now an and you can place any number of configuration files.
+---
 
-Also create a blank `dynamic-ipwhitelist.yml` file within the directory.
+## Files
 
-### Middleware Container
+| File | Purpose |
+|---|---|
+| `update_whitelist.py` | The application (Flask, served by waitress) |
+| `Dockerfile`, `requirements.txt`, `.dockerignore` | Builds the image (`python:3.13-slim`, pinned packages, non-root) |
+| `docker-compose.yml` | Compose service definition, standalone or to merge into your stack |
+| `traefik-forwardauth.yml` | Traefik dynamic config defining the `dynamic-ipwhitelist` middleware (file provider setup only; with Docker labels it isn't needed) |
+| `.github/workflows/docker-publish.yml` | Builds the image and publishes it to GitHub Container Registry |
+| `.github/dependabot.yml` | Automatic update PRs for Actions, the base image and pip packages |
 
-Now use the provided `docker-compose.yml` file and spawn up the new `traefikshaper` container.
+---
 
-Please adjust the Traefik labels and ensure that this container is accessible by authorized persons only.
+## Setup
 
-Following environment variables are available:
+### 1. Image
 
-| Environment Variable                | Description                                                                                                                           | Status      | Default                | Example                               |
-|-----------------------------        |---------------------------------------------------------------------------------------------------------------------------------------|-------------|------------------------|---------------------------------------|
-| APPURL                              | The URL of the traefikshaper application for admin approval requests.                                                                 | Optional    | http://localhost:5000  | `https://traefikshaper.example.com`   |
-| GRANT_HTTP_ENDPOINT                 | The HTTP endpoint for clients to request access.                                                                                      | Optional    | /knock-knock           | `/letmein`                            |
-| EXCLUDED_IPS                        | The `excludeips` ip strategy used in the `IPAllowList` middleware. Define IP addresses to exclude as comma-separated string.          | Optional    |                        | `103.21.244.0/22,103.22.200.0/22`     |
-| WHITELISTED_IPS                     | Adds permanent ip(s) to the `IPAllowList`. Define IP addresses as comma-separated string.                                             | Optional    |                        | `103.21.244.0/22,103.22.200.0/22`     |
-| IPSTRATEGY_DEPTH                    | The `depth` ip strategy used in the `IPAllowList` middleware. Use `1` if Traefik runs behind another proxy (e.g., CloudFlare).        | Optional    | 0                      | `1`                                   | 
-| DEFAULT_PRIVATE_CLASS_SOURCE_RANGE  | If set to `True`, adds the private class subnets 10.0.0.0/8, 172.16.0.0/12 and 192.168.0.0/16 as default to the IPAllowList.          | Optional    | False                  | `True`                                | 
-| EXPIRATION_TIME                     | Expiration time for grants in seconds.                                                                                                | Optional    | 300                    | `3600`                                |
-| SECRET_KEY                          | A secret for HMAC token generation. Creates a random secret if missing.                                                               | Optional    | Randomly generated     | `MySecureSecretForTokenGen`           |
-| APPRISE_NOTIFICATION_URL            | An Apprise notification url. See [here](https://github.com/caronc/apprise). If unset, only container logs will print links.           | Optional    |                        | `tgram://<BOTTOKEN>/<CHAT-ID>`        |
+**Prebuilt (recommended):** multi-arch images (`linux/amd64`, `linux/arm64`) are published
+to GitHub Container Registry:
 
-You can spawn it up as follows:
+```
+ghcr.io/kkawkk/traefikshaper:latest
+```
 
-````
-docker compose up -d
-````
+| Tag | Meaning |
+|---|---|
+| `latest` | Current `main` branch, rebuilt weekly with the newest base image |
+| `1.2.3`, `1.2`, `1` | Released versions (from git tags `v1.2.3`) |
+| `sha-abc1234` | A specific commit |
 
-### Target Containers
+**Build it yourself:** clone this repository and in `docker-compose.yml` replace the
+`image:` line with `build: .`.
 
-For any target containers you wish to protect with this dynamic IP whitelisting setup, you have to add new Traefik labels:
+### 2. Compose service
 
-````
-      # add the new dynamic-ipwhitelist middleware, which denies access in general
-      # this middleware is defined in the new file provider config /dynamic-confs/dynamic-ipwhitelist.yml
-      - traefik.http.routers.CHANGEME.middlewares=dynamic-ipwhitelist@file
+Use `docker-compose.yml` from this repository, or merge its `traefikshaper` service into
+your existing compose file. Fill in `APPURL`, `GRANT_HTTP_ENDPOINT` and
+`APPRISE_NOTIFICATION_URL`.
 
-      # add a new route for the GRANT_HTTP_ENDPOINT endpoint; here default is /knock-knock
-      # requests to this endpoint are forwarded to the `traefikshaper` container
-      # this will trigger the creation of an approval link and telegram notification
-      - traefik.http.routers.CHANGEME-dynamic.rule=PathPrefix(`/knock-knock`)
-      - traefik.http.routers.CHANGEME-dynamic.service=traefikshaper
-      - traefik.http.services.CHANGEME-dynamic.loadbalancer.server.port=5000
-````
+- TraefikShaper must be on the **same Docker network as Traefik**, so that `traefikshaper:5000` resolves.
+- Use `expose:` only. **Never publish port 5000** with `ports:`.
 
-Here is an example of the infamous `whoami` container:
+Optional: make Traefik wait for TraefikShaper when the whole stack starts:
 
-````
-version: '3.3'
+```yaml
+  traefik:
+    depends_on:
+      traefikshaper:
+        condition: service_healthy
+```
 
+### 3. Traefik configuration
+
+Traefik needs two things:
+
+- the **`dynamic-ipwhitelist` middleware**, which points to `http://traefikshaper:5000/auth`
+- a **router for TraefikShaper itself**, so visitors can knock and you can approve
+
+Choose **one** of the two ways below. Both work the same way.
+
+The rules are the same either way:
+
+- **Protected services** reference the middleware.
+- **TraefikShaper's own router** must **not** use the middleware, otherwise nobody could
+  knock. It should route only the knock path and `/approve`, never `/auth`.
+- **Adjust to your setup:** replace `DOMAIN` and `UNIQUEURL`, and the entrypoint name
+  (`websecure`) and certificate resolver (`letsencrypt`), with what your Traefik uses.
+
+#### Option A: Docker labels (Docker provider)
+
+Requires Traefik's Docker provider (`--providers.docker=true`). Add labels to the
+`traefikshaper` service in your compose file:
+
+```yaml
 services:
-
-  whoami:
-    image: traefik/whoami
-    container_name: traefikshaper-whoami
-    command:
-       - --name=whoami
-    networks:
-      - proxy
+  traefikshaper:
+    # ... everything from docker-compose.yml ...
     labels:
       - traefik.enable=true
-      - traefik.docker.network=proxy
-      - traefik.http.routers.whoami.rule=Host(`whoami.example.com`)
-      - traefik.http.routers.whoami.service=whoami
-      - traefik.http.services.whoami.loadbalancer.server.port=80
-      - traefik.http.routers.whoami.middlewares=dynamic-ipwhitelist@file
-      - traefik.http.routers.whoami-dynamic.rule=Host(`whoami.example.com`) && PathPrefix(`/knock-knock`)
-      - traefik.http.routers.whoami-dynamic.service=traefikshaper
-      - traefik.http.services.whoami-dynamic.loadbalancer.server.port=5000
+      # Middleware used by protected services
+      - traefik.http.middlewares.dynamic-ipwhitelist.forwardauth.address=http://traefikshaper:5000/auth
+      - traefik.http.middlewares.dynamic-ipwhitelist.forwardauth.trustForwardHeader=false
+      # TraefikShaper's own router: knock path and /approve only, no middleware
+      - traefik.http.routers.traefikshaper.rule=Host(`DOMAIN`) && (Path(`/UNIQUEURL`) || Path(`/approve`))
+      - traefik.http.routers.traefikshaper.entrypoints=websecure
+      - traefik.http.routers.traefikshaper.tls.certresolver=letsencrypt
+      - traefik.http.services.traefikshaper.loadbalancer.server.port=5000
+      # Only needed if the container is attached to more than one network:
+      # - traefik.docker.network=proxy
+```
 
-networks:
-  proxy:
-    external: true
-````
+Protected services reference the middleware in their labels:
 
-Once spawned, an external party cannot access the whoami service at `https://whoami.example.com/`. The external party will receive a `403 Forbidden` error. However, the external party can browse the `https://whoami.example.com/knock-knock` endpoint, which will be forwarded to the `traefikshaper` container. On success, the external party will receive an HTTP response, stating that an admin was asked for approval. Furthermore, a random word is displayed and highlighted.
+```yaml
+services:
+  myapp:
+    image: myapp
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.myapp.rule=Host(`app.example.com`)
+      - traefik.http.routers.myapp.entrypoints=websecure
+      - traefik.http.routers.myapp.tls.certresolver=letsencrypt
+      - traefik.http.routers.myapp.middlewares=dynamic-ipwhitelist@docker
+```
 
-The admin, on the other hand, will receive an Apprise notification with an approval link and the random word. The admin and external party can now compare the random word, which ensures that the request originated from the external party. Furthermore, the (WAN) IP address of the external party is also included and displayed within the approval link. Once the admin opens the approval link, the (WAN) IP address of the external party will be added to the `IPAllowList` of Traefik's dynamic configuration file `dynamic-ipwhitelist@file`. The external party can now browse `https://whoami.example.com` and gain temporary access to the whoami container service. 
+Notes:
 
-> [!WARNING]
->
-> The TraefikShaper container is usually not exposed to the Internet.
->
-> You may do so for convenient admin approvals, but I recommend accessing it locally or via VPN only.
+- Use the **`@docker`** suffix when the middleware is defined with labels. Inside the same
+  provider the suffix is optional, but routers defined in files must use
+  `dynamic-ipwhitelist@docker`.
+- If the router already has other middlewares, separate them with commas:
+  `middlewares=dynamic-ipwhitelist@docker,other@docker`.
+- The labels live on the TraefikShaper container. If that container is stopped or removed,
+  Traefik drops the middleware and the routers that use it stop working (fail closed).
+- Labels are set by Docker Compose, not by the container, so a compromised container can't
+  change them.
 
-> [!CAUTION]
->
-> If your Traefik reverse proxy runs behind another proxy (e.g. CloudFlare), you must adjust the [IP strategy](https://doc.traefik.io/traefik/middlewares/http/ipwhitelist/#ipstrategy). You can either use the `depth` strategy via the environment varibale `IPSTRATEGY_DEPTH` or the `excludeips` strategy via the environment varibale `EXCLUDED_IPS`.
->
-> Usually, a depth of `1` will work and select the correct client IP address for whitelisting. More details [here](https://vince.ca/posts/traefikee-ipwhitelist-behind-cloudflare/#cloudflare). If your Traefik reverse proxy is exposed directly to the Internet, you can leave the depth at the default value of `0` and ignore all available ip strategies.
-> 
-> Once you have enabled a depth of `1` though, local requests via split brain DNS won't work anymore. You will always receive `403 Forbidden`. Read [this](https://community.traefik.io/t/traefik-v2-ipwhitelist-depth-with-cloudflare-and-local-network/13332) for more info. You can then opt for the `excludeips` strategy and define all CloudFlare IPv4 and IPv6 addresses as comma-separated string. Those IPs will then be excluded by Traefik in the `X-Forwarded-For` HTTP header and the first IP will be used that remains. More information [here](https://www.reddit.com/r/Traefik/comments/skbjd1/comment/ima96of/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button). However, this likely will not resolve the issue, as stated [here](https://community.traefik.io/t/ipwhitelist-with-excludedips-setting-will-result-in-empty-ip-address-when-there-is-1-ip-address-in-x-forwarded-for-header/17491). So TraefikShaper may only work reliably behind a second proxy like CloudFlare if you use the `depth` ip strategy set to `1` and can live with the fact that local requests won't work and cannot match the IPAllowList (will always lead to `Rejecting IP : empty`). Use different routers for internal and external proxy hosts!
+#### Option B: File provider (dynamic configuration files)
 
-## 🙋 FAQ
+Requires Traefik's file provider (e.g. `--providers.file.directory=/etc/traefik/dynamic`).
 
-<details>
-  <summary>Can I apply multiple IPAllowList middlewares to the same container router?</summary>
-    The `dynamic-ipwhitelist@file` middleware must be the single IPAllowList middleware for the container router. The reason for this is that Traefik does not merge IPAllowList source ranges. Each middleware is checked by its own and if the source IP does not match the configured source range for an IPAllowList, access is denied. The TraefikShaper container only manipulates a single IPAllowList middleware and not mutliple ones. Therefore, you have to use a single middleware that states the IPAllowList source ranges allowed. In general, you can use different routers with host rules though.
-</details>
+**Middleware:** copy `traefik-forwardauth.yml` into the dynamic configuration directory.
+If you are migrating from the original TraefikShaper, overwrite the old
+`dynamic-whitelist.yml` with it. The middleware keeps the name `dynamic-ipwhitelist`, so
+existing routers need no changes.
 
-<details>
-  <summary>How do I remove a falsely approved IP?</summary>
-    Either restart the TraefikShaper container, which resets the middleware or manually adjust the `dynamic-whitelist.yml` dynamic configuration file.
-</details>
+```yaml
+http:
+  middlewares:
+    dynamic-ipwhitelist:
+      forwardAuth:
+        address: "http://traefikshaper:5000/auth"
+        trustForwardHeader: false
+```
 
-<details>
-  <summary>Can I use this container with other reverse proxies?</summary>
-    No. TraefikShaper only works with the Traefik reverse proxy (v2 and v3).
-</details>
+This file belongs to Traefik only. Do **not** mount it into the TraefikShaper container.
 
-<details>
-  <summary>This does not work. I only receive 401 Forbidden, even after whitelisting.</summary>
-    Enable Traefik debug logging and inspect the logs. You will see the reasons why the request could not pass the IpAllowList source range. Ensure that only one middleware with `IpAllowList` is in use. Also read up on the `IPSTRATEGY_DEPTH` env variable.
-</details>
+**TraefikShaper router**, e.g. in `traefikshaper-router.yml` in the same directory:
+
+```yaml
+http:
+  routers:
+    traefikshaper:
+      rule: "Host(`DOMAIN`) && (Path(`/UNIQUEURL`) || Path(`/approve`))"
+      entryPoints: [websecure]
+      tls:
+        certResolver: letsencrypt
+      service: traefikshaper
+  services:
+    traefikshaper:
+      loadBalancer:
+        servers:
+          - url: "http://traefikshaper:5000"
+```
+
+**Protected services:**
+
+```yaml
+http:
+  routers:
+    myapp:
+      rule: "Host(`app.example.com`)"
+      entryPoints: [websecure]
+      tls:
+        certResolver: letsencrypt
+      middlewares: [dynamic-ipwhitelist]
+      service: myapp
+```
+
+Use the **`@file`** suffix (`dynamic-ipwhitelist@file`) to reference this middleware from
+Docker labels.
+
+#### Mixing both
+
+Providers can be combined. For example, define the middleware in a file and use it from
+labels:
+
+```yaml
+- traefik.http.routers.myapp.middlewares=dynamic-ipwhitelist@file
+```
+
+Define the middleware in **only one** place. Two definitions with the same name in
+different providers are separate middlewares, which is confusing.
+
+### 4. Start
+
+```sh
+docker compose up -d traefikshaper
+```
+
+Test it by knocking from a phone on mobile data (WiFi off). The notification should show
+the phone's real public IP.
+
+### Updating
+
+Update regularly to pick up Python and package security fixes. The published `latest`
+image is rebuilt every week.
+
+```sh
+# prebuilt image
+docker compose pull traefikshaper && docker compose up -d traefikshaper
+
+# self-built
+docker compose build --pull traefikshaper && docker compose up -d traefikshaper
+```
+
+Updating restarts the container, which clears all current approvals.
+
+---
+
+## Building and publishing (for maintainers)
+
+The workflow in `.github/workflows/docker-publish.yml` builds the image with GitHub
+Actions and pushes it to `ghcr.io/<owner>/<repo>`.
+
+| Trigger | Result |
+|---|---|
+| Push to `main` | `latest` and `sha-…` |
+| Git tag `v1.2.3` | `1.2.3`, `1.2`, `1` and `sha-…` |
+| Every Monday 04:00 UTC | Rebuild of `main` with the newest base image, re-pushes `latest` |
+| Pull request | Build only (nothing is pushed) |
+| Manual (Actions tab, *Run workflow*) | Same as for the selected branch |
+
+Images include an SBOM and signed build provenance. Verify them with:
+
+```sh
+gh attestation verify oci://ghcr.io/kkawkk/traefikshaper:latest --owner kkawkk
+```
+
+**First-time setup:**
+
+1. No secrets are needed. The workflow uses the built-in `GITHUB_TOKEN`.
+2. After the first successful run, open your GitHub profile → **Packages** →
+   `traefikshaper` → **Package settings** and set visibility to **Public**. New GHCR
+   packages are private by default.
+3. In the same settings, check that the package is linked to the repository. It's linked
+   automatically through the image's `org.opencontainers.image.source` label.
+4. If you fork this repository, replace `kkawkk` in `docker-compose.yml` and this README
+   with your own GitHub user or organization name, in lowercase.
+
+To release a version:
+
+```sh
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+---
+
+## Configuration
+
+All settings are environment variables. Boolean values accept `true`, `1` or `yes`
+(any case).
+
+### Basics
+
+| Variable | Default | Description |
+|---|---|---|
+| `APPURL` | `http://localhost:5000` | Public base URL of TraefikShaper, used in approval links |
+| `GRANT_HTTP_ENDPOINT` | `/knock-knock` | Secret knock path. Use something hard to guess. |
+| `APPRISE_NOTIFICATION_URL` | *(unset)* | Apprise URL, e.g. `tgram://BOTTOKEN/CHATID`. If unset or failing, the approval link is written to the container log. |
+| `EXPIRATION_TIME` | `300` | How long an approval lasts, in seconds |
+
+### Allowed addresses
+
+| Variable | Default | Description |
+|---|---|---|
+| `WHITELISTED_IPS` | *(none)* | Comma-separated IPs or CIDRs that are always allowed. Invalid entries are ignored and logged. |
+| `DEFAULT_PRIVATE_CLASS_SOURCE_RANGE` | `False` | `True` always allows `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16`. **Not recommended** (see Security notes). |
+| `ALLOW_SERVER_IP` | `False` | Always allow the server's own public IP (useful with a dynamic IP, e.g. when accessing from the same LAN through the public domain) |
+| `SERVER_IP_CHECK_URLS` | ipify, icanhazip, checkip.amazonaws.com, ipinfo.io | Comma-separated "what is my IP" services that return a plain-text IP, tried in order |
+| `SERVER_IP_MIN_AGREE` | `2` | How many services must return the same IP before it is trusted. `1` accepts the first answer. |
+| `SERVER_IP_CHECK_INTERVAL` | `60` | Seconds between server IP checks |
+| `ALLOW_PRIVATE_APPROVALS` | `False` | Allow knocks from non-public IPs (private, loopback, link-local, CGNAT). Only enable if clients really arrive from such addresses (LAN/VPN). |
+
+### Client IP detection
+
+| Variable | Default | Description |
+|---|---|---|
+| `IPSTRATEGY_DEPTH` | `0` | `0`: the client is the address Traefik received the connection from. `N`: take the N-th entry from the right of the `X-Forwarded-For` header Traefik received (e.g. `1` behind Cloudflare). |
+| `EXCLUDED_IPS` | *(none)* | Alternative to depth: the client is the right-most `X-Forwarded-For` entry not in these ranges |
+
+If Traefik runs behind another proxy (Cloudflare, a load balancer, …):
+
+1. On the Traefik entrypoint, set `forwardedHeaders.trustedIPs` to that proxy's addresses.
+2. On the middleware, set `trustForwardHeader: true` (in `traefik-forwardauth.yml`, or the
+   `...forwardauth.trustForwardHeader=true` label).
+3. In TraefikShaper, set `IPSTRATEGY_DEPTH=1` (or `EXCLUDED_IPS`).
+
+With the defaults (`trustForwardHeader: false`, depth `0`), forged `X-Forwarded-For`
+headers from clients are ignored.
+
+### Abuse limits
+
+| Variable | Default | Description |
+|---|---|---|
+| `REQUEST_COOLDOWN` | `300` | Seconds before the same IP (IPv6: the same /64) can knock again |
+| `MAX_NOTIFICATIONS_PER_HOUR` | `20` | Global cap on approval notifications. When reached, knocks get HTTP 429. |
+| `PENDING_TTL` | `900` | Seconds an approval link stays valid before it is approved |
+
+### Server
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `5000` | Listening port inside the container |
+| `SERVER_THREADS` | `8` | waitress worker threads |
+
+The app must run as a **single process** because all state is in memory. Don't put it
+behind a multi-worker server.
+
+---
+
+## HTTP endpoints
+
+| Path | Method | Reachable from | Purpose |
+|---|---|---|---|
+| `/auth` | any | Traefik only | forwardAuth check: `200` allowed, `403` denied |
+| `GRANT_HTTP_ENDPOINT` | GET | public | Knock: request access for the caller's IP |
+| `/approve` | GET | public | Confirm page (pending) or revoke page (approved). Never changes state. |
+| `/approve` | POST | public | `action=approve` (default) or `action=revoke`. Requires the link's token. |
+| `/healthz` | GET | container | Healthcheck |
+
+---
+
+## Security notes
+
+- **No Traefik config access.** The container mounts nothing except timezone files. If it
+  is compromised, an attacker can at most allow IPs through the `dynamic-ipwhitelist`
+  middleware. They cannot add routers or expose other services.
+- **Fails closed.** If TraefikShaper is down or restarting, Traefik answers `500` for
+  protected routers. Nobody gets in, including whitelisted IPs and the server IP.
+- **Exact-IP approvals.** Approvals match a single address, IPv4 or IPv6 (no `/32`
+  applied to IPv6). IPv6 privacy addresses rotate, so IPv6 clients may need to knock again.
+- **Non-public IPs can't be approved** (unless `ALLOW_PRIVATE_APPROVALS=True`). A private
+  client IP usually means a proxy or Docker gateway is hiding the real client, and
+  approving it would let in everyone behind it.
+- **Avoid broad private ranges** in `WHITELISTED_IPS` or `DEFAULT_PRIVATE_CLASS_SOURCE_RANGE`.
+  If any traffic reaches Traefik through a Docker gateway or proxy container (e.g. IPv6
+  through Docker's userland proxy on an IPv4-only network, or a tunnel container), all of
+  it would bypass the allowlist. Allow specific `/32` addresses instead.
+- **Approval links**
+  - are random 256-bit tokens, compared in constant time
+  - only change state on a POST button click, so link previews can't approve or revoke
+  - can approve only once and expire after `PENDING_TTL`
+  - can revoke only the approval they created
+  - always grant `EXPIRATION_TIME`; the expiry can't be changed through the URL
+- **Server IP lookup** requires `SERVER_IP_MIN_AGREE` independent services to agree, so a
+  single compromised service can't get an arbitrary IP allowed. If no services agree, the
+  last known IP is kept.
+- **Flood limits.** Rate limiting is per IP (IPv6: per /64), plus a global notification cap.
+  A flood can use up the cap and block legitimate knocks for up to an hour. Already-allowed
+  IPs are not affected.
+- **Response headers.** `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, `noindex`
+  and anti-framing headers keep tokens out of referrers and caches.
+
+---
+
+## Troubleshooting
+
+**Traefik logs `Error calling http://traefikshaper:5000/auth ... connection refused` and protected sites return 500**
+TraefikShaper isn't running or is still starting. The port opens about 0.3 s after the
+process starts. Check `docker ps` and `docker logs traefikshaper`, and check that both
+containers share a network.
+
+**Knock returns "Access requests from this address are not allowed" and the log says `Refusing approval request from non-public IP 172.x.x.x`**
+TraefikShaper isn't seeing the real client IP:
+
+- If it's Traefik's own container IP, something is removing `X-Forwarded-For` between
+  Traefik and the app.
+- If it's another container or gateway, a proxy in front of Traefik hides the client. See
+  *Client IP detection*.
+
+**The server's own IP isn't allowed**
+Check that `ALLOW_SERVER_IP=True` is set and that the log shows `Server public IP changed: None -> x.x.x.x`.
+Requests from your LAN only match if they reach Traefik with the public IP as source (hairpin NAT).
+If they arrive with a LAN address instead, add that address to `WHITELISTED_IPS`.
+
+**Traefik logs `middleware "dynamic-ipwhitelist@..." does not exist` and the router returns 404**
+The provider suffix doesn't match where the middleware is defined. Labels mean `@docker`,
+files mean `@file`. With labels, also check that the TraefikShaper container is running and
+has `traefik.enable=true`.
+
+**No notification arrives**
+The approval link is written to the container log (`docker logs traefikshaper`). Check
+`APPRISE_NOTIFICATION_URL`.
+
+**Approvals disappeared**
+The container restarted. State is in memory only, so knock again.
