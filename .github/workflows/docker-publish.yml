@@ -1,15 +1,16 @@
 name: Build and publish image
 
+# Published tags:
+#   1.2.3, 1.2, 1   from a git tag v1.2.3 (plus a GitHub Release)
+#   latest          the highest released version (never a pre-release, never main)
+#   edge            current main branch, for testing before a release
+# Pull requests are built but not pushed.
 on:
   push:
     branches: [main]
     tags: ['v*.*.*']
   pull_request:
     branches: [main]
-  # Weekly rebuild so the image picks up Python/Debian security fixes
-  # even when the code doesn't change.
-  schedule:
-    - cron: '0 4 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -31,10 +32,34 @@ jobs:
       packages: write        # push to ghcr.io
       id-token: write        # sign build provenance attestation
       attestations: write
+    outputs:
+      latest: ${{ steps.release.outputs.latest }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # latest / major tags only move forward: a backport like v1.0.5 released
+      # after v1.1.0 gets 1.0.5 and 1.0, but not 1 or latest.
+      - name: Compare with existing releases
+        id: release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          releases=$(git ls-remote --tags --refs origin 'v*' | sed 's#.*refs/tags/##' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+          major="${TAG%%.*}"
+          highest=$(printf '%s\n' "$releases" | tail -n1)
+          highest_major=$(printf '%s\n' "$releases" | grep -E "^${major}\." | tail -n1)
+          latest=false; is_major=false
+          if [[ "$TAG" != *-* ]]; then
+            [[ "$TAG" == "$highest" ]] && latest=true
+            [[ "$TAG" == "$highest_major" ]] && is_major=true
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "major=$is_major" >> "$GITHUB_OUTPUT"
+          echo "$TAG: latest=$latest major=$is_major (highest release: $highest)"
 
       - name: Set up QEMU (multi-arch)
         uses: docker/setup-qemu-action@v3
@@ -50,21 +75,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tags:
-      #   latest        current main branch (also refreshed by the weekly rebuild)
-      #   1.2.3/1.2/1   from a git tag v1.2.3
-      #   sha-abc1234   per commit
       - name: Image tags and labels
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=edge,branch=main
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix=sha-,enable=${{ github.event_name != 'pull_request' }}
+            type=semver,pattern={{major}},enable=${{ steps.release.outputs.major == 'true' }}
+            type=raw,value=latest,enable=${{ steps.release.outputs.latest == 'true' }}
 
       - name: Build and push
         id: push
@@ -72,8 +94,9 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          pull: true             # always use the newest base image
+          # Nothing to push for pull requests or manual runs on other branches
+          push: ${{ github.event_name != 'pull_request' && steps.meta.outputs.tags != '' }}
+          pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: mode=max
@@ -82,7 +105,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Attest build provenance
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.meta.outputs.tags != ''
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -101,8 +124,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
+          LATEST: ${{ needs.build.outputs.latest }}
         run: |
           VERSION="${TAG#v}"
+          extra=()
+          [[ "$TAG" == *-* ]] && extra+=(--prerelease)
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "$TAG" --generate-notes \
+            --title "$TAG" --generate-notes --latest="${LATEST:-false}" "${extra[@]}" \
             --notes "Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:${VERSION}\`"

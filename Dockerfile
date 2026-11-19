@@ -1,4 +1,6 @@
-FROM python:3.13-slim
+# Pinned by digest so Dependabot opens a PR whenever the base image is rebuilt
+# (e.g. Debian security fixes); merging it updates :edge, the next release ships it.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

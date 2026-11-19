@@ -75,10 +75,11 @@ invalidates all approval links that were already sent.
 | File | Purpose |
 |---|---|
 | `update_whitelist.py` | The application (Flask, served by waitress) |
-| `Dockerfile`, `requirements.txt`, `.dockerignore` | Builds the image (`python:3.13-slim`, pinned packages, non-root) |
+| `Dockerfile`, `requirements.txt`, `.dockerignore` | Builds the image (`python:3.13-slim` pinned by digest, pinned packages, non-root) |
 | `docker-compose.yml` | Compose service definition, standalone or to merge into your stack |
 | `traefik-forwardauth.yml` | Traefik dynamic config defining the `dynamic-ipwhitelist` middleware (file provider setup only; with Docker labels it isn't needed) |
-| `.github/workflows/docker-publish.yml` | Builds the image and publishes it to GitHub Container Registry |
+| `.github/workflows/docker-publish.yml` | Builds the image, publishes it to GitHub Container Registry and creates GitHub Releases |
+| `.github/workflows/security-scan.yml` | Weekly Trivy vulnerability scan of the released image, results in the Security tab |
 | `.github/dependabot.yml` | Automatic update PRs for Actions, the base image and pip packages |
 
 ---
@@ -96,9 +97,9 @@ ghcr.io/kkawkk/traefikshaper:latest
 
 | Tag | Meaning |
 |---|---|
-| `latest` | Current `main` branch, rebuilt weekly with the newest base image |
-| `1.2.3`, `1.2`, `1` | Released versions (from git tags `v1.2.3`) |
-| `sha-abc1234` | A specific commit |
+| `latest` | The newest release (recommended) |
+| `1.2.3`, `1.2`, `1` | A specific release, or the newest release within `1.2.x` / `1.x` |
+| `edge` | Current `main` branch, unreleased. For testing only. |
 
 **Build it yourself:** clone this repository and in `docker-compose.yml` replace the
 `image:` line with `build: .`.
@@ -265,8 +266,8 @@ the phone's real public IP.
 
 ### Updating
 
-Update regularly to pick up Python and package security fixes. The published `latest`
-image is rebuilt every week.
+Update when a new [release](https://github.com/kkawkk/TraefikShaper/releases) is out.
+Releases also carry the base image and package security fixes.
 
 ```sh
 # prebuilt image
@@ -287,16 +288,34 @@ Actions and pushes it to `ghcr.io/<owner>/<repo>`.
 
 | Trigger | Result |
 |---|---|
-| Push to `main` | `latest` and `sha-…` |
-| Git tag `v1.2.3` | `1.2.3`, `1.2`, `1` and `sha-…`, plus a GitHub Release with generated notes |
-| Every Monday 04:00 UTC | Rebuild of `main` with the newest base image, re-pushes `latest` |
+| Push to `main` | `edge` |
+| Git tag `v1.2.3` | `1.2.3`, `1.2`, `1` and `latest`, plus a GitHub Release with generated notes |
 | Pull request | Build only (nothing is pushed) |
-| Manual (Actions tab, *Run workflow*) | Same as for the selected branch |
+| Manual (Actions tab, *Run workflow*) | Same as for the selected branch or tag |
+
+`latest` and `1` only move forward. A backport such as `v1.0.5`, released after `v1.1.0`,
+gets `1.0.5` and `1.0` but leaves `latest` and `1` on 1.1.0. Pre-release tags
+(`v1.2.0-rc1`) only get their own tag and are marked as pre-releases.
+
+**Update flow.** Nothing changes in a published release by itself:
+
+1. Dependabot opens PRs for pip packages, GitHub Actions and the Python base image (pinned
+   by digest, so every rebuilt base image with Debian security fixes becomes a PR).
+   CI builds each PR.
+2. Merging publishes `edge`. Test it.
+3. Tag a release. This publishes `latest` and creates the GitHub Release.
+
+**Vulnerability scan.** `.github/workflows/security-scan.yml` scans `latest` with
+[Trivy](https://trivy.dev) every Monday and after each release, and uploads the results to
+the repository's **Security → Code scanning** tab. Only vulnerabilities with an available
+fix are reported. Alerts close automatically once a later scan doesn't find them anymore,
+usually after the next release. The Trivy action is pinned by commit SHA because of the
+March 2026 compromise of its version tags (CVE-2026-33634).
 
 Images include an SBOM and signed build provenance. Verify them with:
 
 ```sh
-gh attestation verify oci://ghcr.io/kkawkk/traefikshaper:latest --owner kkawkk
+gh attestation verify oci://ghcr.io/kkawkk/traefikshaper:1.1.0 --owner kkawkk
 ```
 
 **First-time setup:**
@@ -313,8 +332,11 @@ gh attestation verify oci://ghcr.io/kkawkk/traefikshaper:latest --owner kkawkk
 To release a version (the tag must have three parts, `v1.0` is ignored):
 
 ```sh
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.1.0 && git push origin v1.1.0
 ```
+
+Before the first release, nothing is published as `latest`. If `docker-compose.yml` points
+to `latest`, tag a release first.
 
 ---
 
