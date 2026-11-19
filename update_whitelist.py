@@ -16,11 +16,13 @@ import secrets
 import logging
 import ipaddress
 import threading
+import zlib
 from collections import deque
 from urllib.parse import urlencode
 
 import requests
 import apprise
+import maxminddb
 from flask import Flask, request, render_template_string, redirect
 
 app = Flask(__name__)
@@ -69,6 +71,19 @@ ALLOW_PRIVATE_APPROVALS = os.getenv('ALLOW_PRIVATE_APPROVALS', 'False').strip().
 
 APPRISE_NOTIFICATION_URL = os.getenv('APPRISE_NOTIFICATION_URL', 'unset')
 
+# Optional GeoIP lookup to show the visitor's country and ASN in notifications.
+# GEOIP_DOWNLOAD=True downloads the free DB-IP Lite databases into GEOIP_DIR and
+# keeps them current. GEOIP_COUNTRY_DB / GEOIP_ASN_DB point to your own .mmdb
+# files instead (DB-IP or MaxMind GeoLite2); a set path is never downloaded to.
+GEOIP_DOWNLOAD = os.getenv('GEOIP_DOWNLOAD', 'False').strip().lower() in ('true', '1', 'yes')
+GEOIP_DIR = os.getenv('GEOIP_DIR', '/tmp/geoip')
+GEOIP_REFRESH_INTERVAL = max(3600, int(os.getenv('GEOIP_REFRESH_INTERVAL', 86400)))
+GEOIP_COUNTRY_DB = os.getenv('GEOIP_COUNTRY_DB', '').strip()
+GEOIP_ASN_DB = os.getenv('GEOIP_ASN_DB', '').strip()
+GEOIP_RETRY_INTERVAL = 3600
+GEOIP_MAX_SIZE = 512 * 1024 * 1024   # decompressed; current Lite files are ~10 MB
+DBIP_URL = 'https://download.db-ip.com/free/dbip-{kind}-lite-{month}.mmdb.gz'
+
 LISTEN_PORT = int(os.getenv('PORT', 5000))
 SERVER_THREADS = int(os.getenv('SERVER_THREADS', 8))
 
@@ -106,6 +121,209 @@ def send_notification(message):
     except Exception as e:
         app.logger.error(f"Failed to send notification: {e}")
         return False
+
+# --------------------------------------------------------------------------
+# GeoIP (optional)
+# --------------------------------------------------------------------------
+
+
+# (database_type prefix, text before link, link text, url). DB-IP's licence asks
+# for a link back on pages showing results; MaxMind requires this notice.
+ATTRIBUTIONS = (
+    ('DBIP', '', 'IP Geolocation by DB-IP', 'https://db-ip.com/'),
+    ('GeoLite2', 'This product includes GeoLite2 data created by MaxMind, available from ',
+     'maxmind.com', 'https://www.maxmind.com'),
+)
+
+
+class MMDB:
+    """
+    A .mmdb file that is reopened when it changes on disk (e.g. a monthly
+    update replacing the file). Missing files are retried.
+    """
+
+    def __init__(self, path, label, download_kind=None):
+        self.path, self.label = path, label
+        self.download_kind = download_kind   # 'country'/'asn' if we download it ourselves
+        self.reader, self.attribution = None, None
+        # False = missing file already reported; downloaded files appear later, don't warn
+        self.mtime = False if download_kind else None
+        self.lock = threading.Lock()
+        self.reload_if_changed()
+
+    def reload_if_changed(self):
+        try:
+            mtime = os.stat(self.path).st_mtime
+        except OSError as e:
+            if self.mtime is not False:   # log once until the file appears
+                app.logger.warning(f"GeoIP {self.label} database {self.path} not available: {e}")
+                self.mtime = False
+            return
+        if mtime == self.mtime:
+            return
+        try:
+            reader = maxminddb.open_database(self.path)
+        except Exception as e:
+            app.logger.error(f"GeoIP {self.label} database {self.path} could not be opened: {e}")
+            self.mtime = mtime   # don't retry until the file changes again
+            return
+        meta = reader.metadata()
+        attribution = next((a[1:] for a in ATTRIBUTIONS if str(meta.database_type).startswith(a[0])), None)
+        with self.lock:
+            old, self.reader, self.mtime, self.attribution = self.reader, reader, mtime, attribution
+        if old is not None:
+            old.close()
+        app.logger.info(f"GeoIP {self.label} database loaded: {self.path} "
+                        f"({meta.database_type}, built {time.strftime('%Y-%m-%d', time.gmtime(meta.build_epoch))})")
+
+    def get(self, ip):
+        with self.lock:
+            if self.reader is None:
+                return None
+            try:
+                return self.reader.get(ip)
+            except Exception as e:
+                app.logger.warning(f"GeoIP {self.label} lookup for {ip} failed: {e}")
+                return None
+
+
+def make_db(path, label, kind):
+    if path:
+        return MMDB(path, label)
+    if GEOIP_DOWNLOAD:
+        return MMDB(os.path.join(GEOIP_DIR, f"dbip-{kind}-lite.mmdb"), label, download_kind=kind)
+    return None
+
+
+geo_country = make_db(GEOIP_COUNTRY_DB, 'country', 'country')
+geo_asn = make_db(GEOIP_ASN_DB, 'ASN', 'asn')
+GEO_DBS = [db for db in (geo_country, geo_asn) if db is not None]
+
+
+def geo_attributions():
+    """Attribution links for the databases in use (deduplicated, in order)."""
+    result = []
+    for db in GEO_DBS:
+        if db.attribution and db.attribution not in result:
+            result.append(db.attribution)
+    return [{'prefix': p, 'text': t, 'url': u} for p, t, u in result]
+
+
+def db_build_month(path):
+    """'YYYY-MM' the .mmdb file was built, or None if missing/unreadable."""
+    try:
+        with maxminddb.open_database(path) as reader:
+            return time.strftime('%Y-%m', time.gmtime(reader.metadata().build_epoch))
+    except Exception:
+        return None
+
+
+def download_dbip(db):
+    """
+    Make sure db.path holds this month's DB-IP Lite file. DB-IP publishes once a
+    month; early in the month the new file may not exist yet, in which case the
+    existing file is kept (or last month's is fetched if there is none).
+    Returns True if the file is current.
+    """
+    now = time.gmtime()
+    month = time.strftime('%Y-%m', now)
+    if db_build_month(db.path) == month:
+        return True
+    prev = f"{now.tm_year - 1}-12" if now.tm_mon == 1 else f"{now.tm_year}-{now.tm_mon - 1:02d}"
+
+    for m in (month, prev):
+        if m == prev and os.path.exists(db.path):
+            return False   # keep the file we have, try the new month again later
+        url = DBIP_URL.format(kind=db.download_kind, month=m)
+        tmp = f"{db.path}.tmp"
+        try:
+            os.makedirs(os.path.dirname(db.path), exist_ok=True)
+            with requests.get(url, stream=True, timeout=(10, 60),
+                              headers={'User-Agent': 'TraefikShaper'}) as resp:
+                if resp.status_code == 404:
+                    continue
+                resp.raise_for_status()
+                inflate = zlib.decompressobj(16 + zlib.MAX_WBITS)   # gzip
+                size = 0
+                with open(tmp, 'wb') as f:
+                    for chunk in resp.iter_content(1024 * 1024):
+                        data = inflate.decompress(chunk)
+                        size += len(data)
+                        if size > GEOIP_MAX_SIZE:
+                            raise ValueError("decompressed file too large")
+                        f.write(data)
+                    f.write(inflate.flush())
+            expected = 'DBIP-Country' if db.download_kind == 'country' else 'DBIP-ASN'
+            with maxminddb.open_database(tmp) as reader:
+                db_type = str(reader.metadata().database_type)
+            if not db_type.startswith(expected):
+                raise ValueError(f"unexpected database type {db_type!r}")
+            os.replace(tmp, db.path)
+            app.logger.info(f"GeoIP: downloaded {url}")
+            db.reload_if_changed()
+            return m == month
+        except Exception as e:
+            app.logger.warning(f"GeoIP: download of {url} failed: {e}")
+            return False
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    app.logger.warning(f"GeoIP: no DB-IP {db.download_kind} database published for {month} or {prev}")
+    return False
+
+
+def geoip_download_loop():
+    """Background thread: download on startup, then check every GEOIP_REFRESH_INTERVAL."""
+    dbs = [db for db in GEO_DBS if db.download_kind]
+    if not dbs:
+        return
+    while True:
+        current = True
+        for db in dbs:
+            try:
+                current = download_dbip(db) and current
+            except Exception as e:
+                app.logger.error(f"GeoIP: update error: {e}")
+                current = False
+        time.sleep(GEOIP_REFRESH_INTERVAL if current else min(GEOIP_RETRY_INTERVAL, GEOIP_REFRESH_INTERVAL))
+
+
+def flag_emoji(iso_code):
+    if len(iso_code) != 2 or not iso_code.isascii() or not iso_code.isalpha():
+        return ''
+    return ''.join(chr(0x1F1E6 + ord(c) - ord('A')) for c in iso_code.upper())
+
+
+def geo_lookup(ip):
+    """Return e.g. '🇺🇸 United States (US), AS15169 Google LLC' (or '🇺🇸 US, ...' when the
+    database has no country names), or '' if unknown/disabled."""
+    parts = []
+
+    rec = geo_country.get(ip) if geo_country else None
+    if isinstance(rec, dict):
+        # MaxMind/DB-IP layout: {'country': {'iso_code', 'names'}};
+        # ip-location-db layout: {'country_code': 'US'}
+        country = rec.get('country') or rec.get('registered_country') or {}
+        if not isinstance(country, dict):
+            country = {}
+        iso = str(country.get('iso_code') or rec.get('country_code') or '')
+        name = str((country.get('names') or {}).get('en') or '')
+        if iso or name:
+            label = f"{name} ({iso})" if name and iso else (name or iso)
+            parts.append(f"{flag_emoji(iso)} {label}".strip())
+
+    rec = geo_asn.get(ip) if geo_asn else None
+    if isinstance(rec, dict):
+        asn = rec.get('autonomous_system_number')
+        org = str(rec.get('autonomous_system_organization') or '')
+        if asn or org:
+            parts.append(f"AS{asn} {org}".strip() if asn else org)
+
+    return ', '.join(parts)
+
+
+def describe_ip(ip, geo):
+    return f"{ip} [{geo}]" if geo else ip
 
 # --------------------------------------------------------------------------
 # IP helpers
@@ -269,6 +487,7 @@ CONFIRM_PAGE = """<!DOCTYPE html>
     <div class="container">
         <h1>Approve access?</h1>
         <p>IP address: <span class="highlight">{{ ip }}</span></p>
+        {% if geo %}<p>Location / network: {{ geo }}</p>{% endif %}
         <p>Validation code: <span class="highlight">{{ code }}</span></p>
         <p>Access will be granted for {{ expiration }} seconds.</p>
         <form method="post" action="{{ action }}">
@@ -276,6 +495,7 @@ CONFIRM_PAGE = """<!DOCTYPE html>
             <input type="hidden" name="token" value="{{ token }}">
             <button type="submit" name="action" value="approve">Approve</button>
         </form>
+        {% if geo and attributions %}<p class="hint">{% for a in attributions %}{{ a.prefix }}<a href="{{ a.url }}" rel="noreferrer">{{ a.text }}</a>{% if not loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
     </div>
 </body>
 </html>
@@ -294,6 +514,7 @@ REVOKE_PAGE = """<!DOCTYPE html>
         {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
         <h1>Access active</h1>
         <p>IP address: <span class="highlight">{{ ip }}</span></p>
+        {% if geo %}<p>Location / network: {{ geo }}</p>{% endif %}
         <p>Allowed until {{ until }} ({{ remaining }} left).</p>
         <form method="post" action="{{ action }}">
             <input type="hidden" name="ip" value="{{ ip }}">
@@ -301,6 +522,7 @@ REVOKE_PAGE = """<!DOCTYPE html>
             <button type="submit" name="action" value="revoke" class="danger">Revoke access</button>
         </form>
         <p class="hint">Open the approval link again any time before expiry to revoke.</p>
+        {% if geo and attributions %}<p class="hint">{% for a in attributions %}{{ a.prefix }}<a href="{{ a.url }}" rel="noreferrer">{{ a.text }}</a>{% if not loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
     </div>
 </body>
 </html>
@@ -380,6 +602,7 @@ def request_access():
     wait_for_initial_server_ip()
     now = time.time()
     key = rate_limit_key(ip)
+    geo = geo_lookup(ip)   # outside the lock: local file read only
 
     with state_lock:
         if is_allowed(ip):
@@ -400,10 +623,13 @@ def request_access():
 
         token = secrets.token_urlsafe(32)
         code = random_code()
-        pending[ip] = {'token': token, 'created': now, 'code': code}
+        pending[ip] = {'token': token, 'created': now, 'code': code, 'geo': geo}
 
     approval_link = f"{APPURL}/approve?" + urlencode({'ip': ip, 'token': token})
-    message = f"Access request from {ip} (code: {code})\n{approval_link}"
+    message = f"Access request from {ip} (code: {code})\n"
+    if geo:
+        message += f"{geo}\n"
+    message += approval_link
 
     if send_notification(message):
         return render_template_string(REQUEST_PAGE, code=code), 200
@@ -452,7 +678,8 @@ def render_revoke_page(ip, notice=None):
     """Hold state_lock."""
     entry = approved[ip]
     return render_template_string(
-        REVOKE_PAGE, ip=ip, token=entry['token'], notice=notice,
+        REVOKE_PAGE, ip=ip, token=entry['token'], notice=notice, geo=entry.get('geo', ''),
+        attributions=geo_attributions(),
         until=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(entry['expiry'])),
         remaining=format_remaining(entry['expiry'] - time.time()),
         action=f"{APPURL}/approve")
@@ -470,7 +697,8 @@ def approve_confirm():
         ip, entry = lookup_pending(ip_raw, token)
         if ip is not None:
             return render_template_string(
-                CONFIRM_PAGE, ip=ip, code=entry['code'], token=entry['token'],
+                CONFIRM_PAGE, ip=ip, code=entry['code'], token=entry['token'], geo=entry['geo'],
+                attributions=geo_attributions(),
                 expiration=EXPIRATION_TIME, action=f"{APPURL}/approve"), 200
 
         # Same link, already approved and not expired: offer to revoke
@@ -492,15 +720,16 @@ def approve_post():
 def approve_ip():
     ip_raw, token = request.form.get('ip'), request.form.get('token')
     with state_lock:
-        ip, _ = lookup_pending(ip_raw, token)
+        ip, entry = lookup_pending(ip_raw, token)
         if ip is None or not is_approvable(ip):
             return message_page('Link not valid', 'This link is invalid, expired or was already used.', 403)
         del pending[ip]
+        geo = entry['geo']
         # Keep the token so the same link can revoke this approval
-        approved[ip] = {'expiry': time.time() + EXPIRATION_TIME, 'token': token}
+        approved[ip] = {'expiry': time.time() + EXPIRATION_TIME, 'token': token, 'geo': geo}
 
-    app.logger.info(f"Approved {ip} for {EXPIRATION_TIME} seconds")
-    notified = send_notification(f"✅ Whitelisted {ip} for {format_remaining(EXPIRATION_TIME)}.")
+    app.logger.info(f"Approved {describe_ip(ip, geo)} for {EXPIRATION_TIME} seconds")
+    notified = send_notification(f"✅ Whitelisted {describe_ip(ip, geo)} for {format_remaining(EXPIRATION_TIME)}.")
     notice = 'IP address approved.' + ('' if notified else ' (Notification failed.)')
     with state_lock:
         if lookup_approved(ip, token) is None:   # revoked/expired in the meantime
@@ -514,10 +743,10 @@ def revoke_ip():
         ip = lookup_approved(ip_raw, token)
         if ip is None:
             return message_page('Link not valid', 'This approval is not active anymore.', 403)
-        del approved[ip]
+        geo = approved.pop(ip).get('geo', '')
 
-    app.logger.info(f"Revoked {ip}")
-    send_notification(f"🚫 Revoked access for {ip}.")
+    app.logger.info(f"Revoked {describe_ip(ip, geo)}")
+    send_notification(f"🚫 Revoked access for {describe_ip(ip, geo)}.")
     return message_page('Access revoked', f'{ip} is no longer allowed.', 200)
 
 # --------------------------------------------------------------------------
@@ -571,8 +800,8 @@ def maintenance_loop():
 
             with state_lock:
                 # is_allowed() already checks expiry; this just cleans up and notifies
-                expired = [ip for ip, a in approved.items() if a['expiry'] < now]
-                for ip in expired:
+                expired = [(ip, a.get('geo', '')) for ip, a in approved.items() if a['expiry'] < now]
+                for ip, _ in expired:
                     del approved[ip]
 
                 for ip in [ip for ip, e in pending.items() if now - e['created'] > PENDING_TTL]:
@@ -586,9 +815,13 @@ def maintenance_loop():
                     server_ip = new_server_ip
             server_ip_ready.set()
 
-            for ip in expired:
-                app.logger.info(f"Access for {ip} expired")
-                send_notification(f"❌ Removed {ip} from whitelist. Access revoked.")
+            for ip, geo in expired:
+                app.logger.info(f"Access for {describe_ip(ip, geo)} expired")
+                send_notification(f"❌ Removed {describe_ip(ip, geo)} from whitelist. Access revoked.")
+
+            # Pick up updated database files (cheap stat() calls)
+            for db in GEO_DBS:
+                db.reload_if_changed()
         except Exception as e:
             app.logger.error(f"Maintenance loop error: {e}")
             server_ip_ready.set()   # never leave requests waiting on a broken check
@@ -605,6 +838,7 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     threading.Thread(target=maintenance_loop, daemon=True).start()
+    threading.Thread(target=geoip_download_loop, daemon=True).start()
     # In the background: a slow notification must not delay opening the port
     # (until it's open, Traefik answers 500 for every protected request).
     threading.Thread(target=send_notification, args=("⭐ TraefikShaper Enabled | whitelist reset ⭐",),

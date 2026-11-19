@@ -288,7 +288,7 @@ Actions and pushes it to `ghcr.io/<owner>/<repo>`.
 | Trigger | Result |
 |---|---|
 | Push to `main` | `latest` and `sha-…` |
-| Git tag `v1.2.3` | `1.2.3`, `1.2`, `1` and `sha-…` |
+| Git tag `v1.2.3` | `1.2.3`, `1.2`, `1` and `sha-…`, plus a GitHub Release with generated notes |
 | Every Monday 04:00 UTC | Rebuild of `main` with the newest base image, re-pushes `latest` |
 | Pull request | Build only (nothing is pushed) |
 | Manual (Actions tab, *Run workflow*) | Same as for the selected branch |
@@ -310,7 +310,7 @@ gh attestation verify oci://ghcr.io/kkawkk/traefikshaper:latest --owner kkawkk
 4. If you fork this repository, replace `kkawkk` in `docker-compose.yml` and this README
    with your own GitHub user or organization name, in lowercase.
 
-To release a version:
+To release a version (the tag must have three parts, `v1.0` is ignored):
 
 ```sh
 git tag v1.0.0 && git push origin v1.0.0
@@ -369,6 +369,49 @@ headers from clients are ignored.
 | `MAX_NOTIFICATIONS_PER_HOUR` | `20` | Global cap on approval notifications. When reached, knocks get HTTP 429. |
 | `PENDING_TTL` | `900` | Seconds an approval link stays valid before it is approved |
 
+### GeoIP (optional)
+
+Adds the visitor's country and network (ASN) to notifications and the approve/revoke
+pages, e.g. `Access request from 8.8.8.8 (code: amber-falcon)` followed by
+`🇺🇸 United States (US), AS15169 Google LLC`. Lookups are done locally; visitor IPs are never
+sent anywhere.
+
+**Automatic (recommended):** set `GEOIP_DOWNLOAD=True`. On startup TraefikShaper downloads
+the free [DB-IP Lite](https://db-ip.com/db/lite.php) country and ASN databases (no account
+needed, ~20 MB together) from `download.db-ip.com`, and checks once a day whether the next
+monthly release is out. It keeps using the old file until the new one has been downloaded and
+checked, so a failed download never removes GeoIP information. By default the files go to
+`/tmp/geoip` (the container's tmpfs), so they're downloaded again after every restart.
+To keep them, mount a volume writable by UID 1000 at `GEOIP_DIR`.
+
+**Your own files:** set `GEOIP_COUNTRY_DB` and/or `GEOIP_ASN_DB` to `.mmdb` files you mount
+(DB-IP Lite or MaxMind GeoLite2). A set path is used as-is and never downloaded to. Mount the
+**directory** read-only (e.g. `./geoip:/geoip:ro`) rather than single files, and replace the
+files by renaming the new one over the old one. TraefikShaper notices within ~10 seconds and
+reloads without a restart.
+
+| Variable | Default | Description |
+|---|---|---|
+| `GEOIP_DOWNLOAD` | `False` | `True` downloads and refreshes DB-IP Lite country + ASN databases (for any of the two paths below that is unset) |
+| `GEOIP_DIR` | `/tmp/geoip` | Where downloaded databases are stored |
+| `GEOIP_REFRESH_INTERVAL` | `86400` | Seconds between update checks (minimum 3600). Failed or not-yet-published updates are retried hourly. |
+| `GEOIP_COUNTRY_DB` | *(unset)* | Path to your own country `.mmdb` (DB-IP or GeoLite2; City databases work too) |
+| `GEOIP_ASN_DB` | *(unset)* | Path to your own ASN `.mmdb` (DB-IP or GeoLite2-ASN) |
+
+A missing or unreadable database only logs a warning. Notifications are then sent without
+that information.
+
+#### Data licence and attribution
+
+The DB-IP Lite databases are © [DB-IP.com](https://db-ip.com), licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). DB-IP asks web applications that
+display results from the database to link back to DB-IP.com. TraefikShaper does this
+automatically: when the approve/revoke page shows GeoIP information, it adds an
+"IP Geolocation by DB-IP" link at the bottom. If you use your own MaxMind GeoLite2 files,
+the page shows MaxMind's required notice instead. This repository doesn't contain or
+redistribute any database. If you pass the data on in another form (e.g. share the downloaded
+files or publish lookup results), the attribution requirement applies to you as well.
+
 ### Server
 
 | Variable | Default | Description |
@@ -395,7 +438,10 @@ behind a multi-worker server.
 
 ## Security notes
 
-- **No Traefik config access.** The container mounts nothing except timezone files. If it
+- **No Traefik config access.** The container mounts nothing except timezone files (and,
+  optionally, GeoIP databases). With `GEOIP_DOWNLOAD=True` it makes outbound requests to
+  `download.db-ip.com` for the database files only. Downloads are size-capped and checked
+  as valid DB-IP databases before they replace the current file. If it
   is compromised, an attacker can at most allow IPs through the `dynamic-ipwhitelist`
   middleware. They cannot add routers or expose other services.
 - **Fails closed.** If TraefikShaper is down or restarting, Traefik answers `500` for

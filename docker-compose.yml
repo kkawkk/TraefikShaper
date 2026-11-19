@@ -33,6 +33,14 @@ services:
       # - SERVER_IP_CHECK_URLS=https://api.ipify.org,https://ipv4.icanhazip.com,https://checkip.amazonaws.com,https://ipinfo.io/ip
       # - SERVER_IP_MIN_AGREE=2        # services that must return the same IP
       # - SERVER_IP_CHECK_INTERVAL=60  # seconds
+      # Country + ASN in notifications: downloads free DB-IP Lite databases on startup and
+      # refreshes them monthly (attribution to DB-IP is shown on the approval page).
+      - GEOIP_DOWNLOAD=True
+      # - GEOIP_DIR=/tmp/geoip   # mount a volume here to keep the files across restarts
+      # Or use your own .mmdb files instead (mount ./geoip:/geoip:ro below):
+      # - GEOIP_COUNTRY_DB=/geoip/dbip-country-lite.mmdb
+      # - GEOIP_ASN_DB=/geoip/dbip-asn-lite.mmdb
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
+      # - ./geoip:/geoip:ro   # only for your own GEOIP_COUNTRY_DB / GEOIP_ASN_DB files
