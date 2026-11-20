@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # latest / major tags only move forward: a backport like v1.0.5 released
       # after v1.1.0 gets 1.0.5 and 1.0, but not 1 or latest.
