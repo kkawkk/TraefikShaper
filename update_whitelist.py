@@ -18,7 +18,7 @@ import ipaddress
 import threading
 import zlib
 from collections import deque
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import requests
 import apprise
@@ -561,8 +561,18 @@ def random_code():
     return f"{secrets.choice(CODE_WORDS)}-{secrets.choice(CODE_WORDS)}"
 
 
+# Pages use only inline <style> and forms posting to APPURL; nothing else may load.
+_appurl = urlsplit(APPURL)
+CONTENT_SECURITY_POLICY = (
+    "default-src 'none'; style-src 'unsafe-inline'; "
+    f"form-action 'self' {_appurl.scheme}://{_appurl.netloc}; "
+    "frame-ancestors 'none'; base-uri 'none'"
+)
+
+
 @app.after_request
 def security_headers(response):
+    response.headers['Content-Security-Policy'] = CONTENT_SECURITY_POLICY
     response.headers['Referrer-Policy'] = 'no-referrer'
     response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Robots-Tag'] = 'noindex, nofollow'
