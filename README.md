@@ -19,7 +19,7 @@
 | **Flooding** | Per-IP limit only (with IPv6, unlimited addresses); memory grew without bound | Rate limit per IP / IPv6 /64, a global hourly notification cap, and periodic cleanup |
 | **Race conditions** | Unlocked read-modify-write of the config file could put expired IPs back | In-memory state under a lock, no file |
 | **Server's own IP** | Not available | Optional (`ALLOW_SERVER_IP`), with fallback IP services that must agree with each other |
-| **Runtime** | Stale Python base, Flask development server, published port 5000 in the example | `python:3.13-slim`, pinned packages, waitress, non-root, read-only filesystem, healthcheck, internal port only |
+| **Runtime** | Stale Python base, Flask development server, published port 5000 in the example | `python:3.15-alpine`, pinned packages, waitress, non-root, read-only filesystem, healthcheck, internal port only |
 
 ---
 
@@ -75,7 +75,7 @@ invalidates all approval links that were already sent.
 | File | Purpose |
 |---|---|
 | `update_whitelist.py` | The application (Flask, served by waitress) |
-| `Dockerfile`, `requirements.txt`, `.dockerignore` | Builds the image (`python:3.13-slim` pinned by digest, pinned packages, non-root) |
+| `Dockerfile`, `requirements.txt`, `.dockerignore` | Builds the image (`python:3.15-alpine` pinned by digest, pinned packages, non-root) |
 | `docker-compose.yml` | Compose service definition, standalone or to merge into your stack |
 | `traefik-forwardauth.yml` | Traefik dynamic config defining the `dynamic-ipwhitelist` middleware (file provider setup only; with Docker labels it isn't needed) |
 | `.github/workflows/docker-publish.yml` | Builds the image, publishes it to GitHub Container Registry and creates GitHub Releases |
@@ -300,7 +300,7 @@ gets `1.0.5` and `1.0` but leaves `latest` and `1` on 1.1.0. Pre-release tags
 **Update flow.** Nothing changes in a published release by itself:
 
 1. Dependabot opens PRs for pip packages, GitHub Actions and the Python base image (pinned
-   by digest, so every rebuilt base image with Debian security fixes becomes a PR).
+   by digest, so every rebuilt base image with Alpine security fixes becomes a PR).
    CI builds each PR.
 2. Merging publishes `edge`. Test it.
 3. Tag a release. This publishes `latest` and creates the GitHub Release.
